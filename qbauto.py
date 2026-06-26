@@ -6,6 +6,7 @@ subfolder of SAVE_ROOT that mirrors the query file's top-level folder name."""
 import base64
 import logging
 import os
+import re
 import shutil
 import sys
 import threading
@@ -30,8 +31,39 @@ SEARCH_TIMEOUT = 15
 MAX_CONCURRENT_SEARCHES = 5
 STABLE_FILE_AGE = 2
 LOG_FILE = str(Path(__file__).resolve().parent / "qbauto.log")
+MIN_MATCH_FRACTION = 0.5
 
 SKIP_DIRS = {"done", "error", "skipped"}
+
+YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+STOPWORDS = frozenset({
+    "a", "an", "the", "of", "and", "or", "for", "in", "on", "at", "to",
+    "is", "it", "as", "by", "with", "we", "me", "my", "de", "ki", "ka",
+    "ko", "koi", "hai", "ho", "na", "ra", "le", "la", "aa", "ab",
+})
+
+
+def normalize_words(query):
+    text = query.lower()
+    text = YEAR_RE.sub(" ", text)
+    tokens = re.findall(r"[a-z0-9]+", text)
+    return [t for t in tokens if t not in STOPWORDS and len(t) > 1]
+
+
+def score_result(query, result):
+    query_words = normalize_words(query)
+    name = result.get("fileName", "").lower()
+    if not name:
+        return 0.0
+    matched = 0
+    for w in query_words:
+        for part in re.split(r"[^a-z0-9]+", name):
+            if w in part:
+                matched += 1
+                break
+    if not query_words:
+        return 1.0
+    return matched / len(query_words)
 
 logger = logging.getLogger("qbauto")
 
@@ -123,9 +155,19 @@ class QBClient:
 
     def torrents_add(self, urls, savepath):
         data = {"urls": urls, "savepath": savepath}
-        text = self._request("POST", "/api/v2/torrents/add", data=data).text.strip()
+        resp = self._request("POST", "/api/v2/torrents/add", data=data)
+        text = resp.text.strip()
+        if resp.status_code != 200:
+            raise RuntimeError(f"torrents/add failed: HTTP {resp.status_code} {text!r}")
         if text.lower().startswith("fail"):
             raise RuntimeError(f"torrents/add failed: {text!r}")
+        try:
+            body = resp.json()
+            if isinstance(body, dict) and body.get("failure_count", 0) > 0:
+                raise RuntimeError(f"torrents/add failed: {body!r}")
+        except ValueError:
+            pass
+        return True
 
 
 def parse_magnet_hash(file_url):
@@ -162,15 +204,17 @@ def process_query(client, query, save_subfolder):
     savepath = str(Path(SAVE_ROOT) / save_subfolder) if save_subfolder else str(Path(SAVE_ROOT))
     sid = client.search_start(query)
     logger.info(f"[search] started id={sid} query={query!r}")
-    best = None
+    all_results = []
+    seen_urls = set()
     deadline = time.time() + SEARCH_TIMEOUT
     try:
         while time.time() < deadline:
             results, status = client.search_all_results(sid)
             for r in results:
-                seeds = int(r.get("nbSeeders", 0))
-                if best is None or seeds > int(best.get("nbSeeders", 0)):
-                    best = r
+                url = r.get("fileUrl", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    all_results.append(r)
             if status == "Stopped":
                 break
             time.sleep(1)
@@ -178,23 +222,51 @@ def process_query(client, query, save_subfolder):
         client.search_stop(sid)
         client.search_delete(sid)
 
-    if best is None:
+    if not all_results:
         logger.warning(f"[search] no results for {query!r}")
         return ("error", query, None)
 
-    seeds = int(best.get("nbSeeders", 0))
-    title = best.get("fileName", "?")
-    file_url = best.get("fileUrl", "")
-    logger.info(f"[search] winner query={query!r} title={title!r} seeds={seeds}")
+    query_words = normalize_words(query)
+    scored = []
+    for r in all_results:
+        frac = score_result(query, r)
+        if query_words and frac < MIN_MATCH_FRACTION:
+            continue
+        scored.append((frac, r))
+    if not scored:
+        logger.warning(f"[search] no relevant results for {query!r}")
+        return ("error", query, None)
 
-    if is_duplicate(client, best):
-        logger.info(f"[dup] already in qB: {title!r}")
-        return ("skipped", query, title)
+    best_frac = max(s for s, _ in scored)
+    candidates = [r for f, r in scored if f == best_frac]
+    candidates.sort(
+        key=lambda r: (-int(r.get("nbSeeders", 0)), not r.get("fileUrl", "").startswith("magnet:"))
+    )
+    logger.info(
+        f"[search] {len(scored)} relevant results for {query!r} "
+        f"(best match fraction {best_frac:.2f})"
+    )
 
     os.makedirs(savepath, exist_ok=True)
-    client.torrents_add(file_url, savepath)
-    logger.info(f"[add] {title!r} -> {savepath}")
-    return ("added", query, title)
+    for candidate in candidates:
+        seeds = int(candidate.get("nbSeeders", 0))
+        title = candidate.get("fileName", "?")
+        file_url = candidate.get("fileUrl", "")
+
+        if is_duplicate(client, candidate):
+            logger.info(f"[dup] already in qB: {title!r}")
+            return ("skipped", query, title)
+
+        try:
+            client.torrents_add(file_url, savepath)
+            logger.info(f"[add] {title!r} -> {savepath} (seeds={seeds})")
+            return ("added", query, title)
+        except Exception as e:
+            logger.warning(f"[add] failed for {title!r}: {e}; trying next candidate")
+            continue
+
+    logger.warning(f"[search] all candidates failed for {query!r}")
+    return ("error", query, None)
 
 
 def move_to_folder(src_file, dest_dirname):
