@@ -59,7 +59,7 @@ class QBClient:
     def _login_locked(self):
         data = {"username": self.user, "password": self.password}
         resp = self.session.post(self.base + "/api/v2/auth/login", data=data, timeout=30)
-        if resp.text.strip() != "Ok.":
+        if resp.status_code != 204 and resp.text.strip() != "Ok.":
             raise RuntimeError(f"qBittorrent login failed: {resp.text!r}")
         logger.info("Logged in to qBittorrent")
 
